@@ -1,0 +1,143 @@
+# ============================================================================
+#  Estimating an Inheritance with a Markov / Monte Carlo Model
+#  MA2404 Markov Processes - reproducible analysis
+#
+#  Problem: a 60-year-old holds S0 = 1000 in a single FTSE-100 stock (Tesco).
+#  The stock is sold on the day he dies and the proceeds are inherited. We
+#  estimate the distribution of the inherited sum S = S_N, where N is the
+#  (random) number of remaining years of life.
+#
+#      log S = log S0 + sum_{i=1}^{N} X_i,   X_i = log(S_i / S_{i-1})
+#
+#  Step 1: model N with a Gompertz distribution (fit to UK mortality data)
+#  Step 2: model X_i as Normal (parameters via the method of percentiles),
+#          using live Tesco prices pulled with quantmod
+#  Step 3: combine via Monte Carlo simulation
+#
+#  Run:  Rscript R/markov_inheritance.R   (from the repo root)
+#  Deps: base R + quantmod  ->  install.packages("quantmod")
+#        (Part 2 needs internet to download prices from Yahoo Finance.)
+# ============================================================================
+
+set.seed(2024)                     # reproducibility
+S0      <- 1000                    # initial investment
+AGE0    <- 60                      # current age
+N_SIMS  <- 100000                  # Monte Carlo iterations
+
+# ---------------------------------------------------------------------------
+# PART 1.  Distribution of N (remaining lifetime) via the Gompertz model
+# ---------------------------------------------------------------------------
+# Gompertz hazard (force of mortality) at duration t years past age AGE0:
+#     mu(t) = b * exp(eta * t)
+# Survival function:
+#     S(t) = exp( -(b/eta) * (exp(eta * t) - 1) )
+# log(hazard) is linear in t, so estimate (b, eta) by regressing
+# log(mortality rate) on duration.
+
+life  <- read.csv("data/uk_life_table.csv")           # age, mx, qx, lx, dx, ex
+adult <- subset(life, age >= AGE0)
+t      <- adult$age - AGE0                             # years past age 60
+log_mu <- log(adult$mx)                                # log central mortality rate
+
+fit  <- lm(log_mu ~ t)
+eta  <- unname(coef(fit)[2])                           # shape  (slope)
+b    <- unname(exp(coef(fit)[1]))                      # baseline hazard (intercept)
+cat(sprintf("Gompertz fit:  b = %.6f   eta = %.5f\n", b, eta))
+
+# Sanity check against published life expectancy at 60 (ex column)
+gompertz_survival <- function(t) exp(-(b / eta) * (exp(eta * t) - 1))
+ex60_model <- integrate(gompertz_survival, 0, 60)$value
+cat(sprintf("Modelled e(60) = %.2f yrs  |  life-table e(60) = %.2f yrs\n",
+            ex60_model, adult$ex[1]))
+
+# Sample N by inverting the Gompertz CDF
+sample_gompertz <- function(n) {
+  u <- runif(n)
+  t <- (1 / eta) * log(1 - (eta / b) * log(u))
+  pmax(round(t), 0)                                    # whole years, >= 0
+}
+
+# ---------------------------------------------------------------------------
+# PART 2.  Yearly log-returns X_i for Tesco (Normal, method of percentiles)
+# ---------------------------------------------------------------------------
+# Method of percentiles: match two sample quantiles to standard-Normal
+# z-scores to back out (mu, sigma).
+estimate_normal_by_percentiles <- function(x, p_lo = 0.25, p_hi = 0.75) {
+  q_lo <- as.numeric(quantile(x, p_lo))
+  q_hi <- as.numeric(quantile(x, p_hi))
+  z_lo <- qnorm(p_lo); z_hi <- qnorm(p_hi)
+  sigma <- (q_hi - q_lo) / (z_hi - z_lo)
+  mu    <- q_hi - z_hi * sigma
+  c(mu = mu, sigma = sigma)
+}
+
+# Pull Tesco PLC prices directly from Yahoo Finance.
+# Tesco trades on the London Stock Exchange under the ticker "TSCO.L".
+library(quantmod)
+
+tsco <- getSymbols("TSCO.L", src = "yahoo",
+                   from = "1984-01-01", to = "2024-12-31",
+                   auto.assign = FALSE)
+
+# Collapse daily prices to one year-end (adjusted) close per year, so that
+# X_i = log(S_i / S_{i-1}) is a yearly log-return, matching the brief.
+yearly_price <- to.yearly(Ad(tsco), OHLC = FALSE)      # year-end adjusted close
+log_returns  <- diff(log(as.numeric(yearly_price)))    # yearly log-returns
+
+params <- estimate_normal_by_percentiles(log_returns)
+mu     <- unname(params["mu"])
+sigma  <- unname(params["sigma"])
+cat(sprintf("Tesco yearly log-returns: n = %d,  mu = %.4f,  sigma = %.4f\n",
+            length(log_returns), mu, sigma))
+
+# ---------------------------------------------------------------------------
+# PART 3.  Monte Carlo for the distribution of log S
+# ---------------------------------------------------------------------------
+# Each simulation: draw N, draw N i.i.d. X_i ~ Normal(mu, sigma),
+# log S = log S0 + sum(X_i).  Repeat N_SIMS times.
+N_draws <- sample_gompertz(N_SIMS)
+logS <- log(S0) + vapply(
+  N_draws,
+  function(n) if (n == 0) 0 else sum(rnorm(n, mu, sigma)),
+  numeric(1)
+)
+
+mean_logS <- mean(logS); var_logS <- var(logS)
+
+# Closed-form cross-check (law of total mean / variance):
+#   E[log S]   = log S0 + E[N] * mu
+#   Var[log S] = E[N] * sigma^2 + Var[N] * mu^2
+EN <- mean(N_draws); VN <- var(N_draws)
+mean_cf <- log(S0) + EN * mu
+var_cf  <- EN * sigma^2 + VN * mu^2
+
+cat("\n--- Results -----------------------------------------------------\n")
+cat(sprintf("E[N]               = %.2f years\n", EN))
+cat(sprintf("E[log S]           = %.4f   (closed form %.4f)\n", mean_logS, mean_cf))
+cat(sprintf("Var[log S]         = %.4f   (closed form %.4f)\n", var_logS, var_cf))
+cat(sprintf("Median inherited S = %.2f\n", exp(median(logS))))
+cat(sprintf("Mean   inherited S = %.2f\n", mean(exp(logS))))
+qS <- quantile(exp(logS), c(0.05, 0.95))
+cat(sprintf("90%% interval for S = [%.0f, %.0f]\n", qS[1], qS[2]))
+
+# ---------------------------------------------------------------------------
+# Figures
+# ---------------------------------------------------------------------------
+dir.create("figures", showWarnings = FALSE)
+
+png("figures/mortality_fit.png", width = 900, height = 600)
+plot(adult$age, adult$mx, log = "y", pch = 16, col = "steelblue",
+     xlab = "Age", ylab = "Central mortality rate (log scale)",
+     main = "Gompertz fit to UK mortality, ages 60+")
+lines(adult$age, b * exp(eta * t), col = "firebrick", lwd = 2)
+legend("topleft", c("Observed", "Gompertz fit"),
+       col = c("steelblue", "firebrick"), pch = c(16, NA), lwd = c(NA, 2))
+dev.off()
+
+png("figures/logS_distribution.png", width = 900, height = 600)
+hist(logS, breaks = 60, col = "grey85", border = "white",
+     xlab = "log S", main = "Monte Carlo distribution of log S")
+abline(v = mean_logS, col = "firebrick", lwd = 2)
+dev.off()
+
+cat("\nFigures written to figures/.\n")

@@ -1,0 +1,20 @@
+# R
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.Rapp.history
+*.Rproj
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*~
+
+# Output that can be regenerated (uncomment if you prefer not to commit figures)
+# figures/
+
+# Course materials - do NOT publish copyrighted briefs / module notes
+Project2024_MA2404.pdf
+MA7404-2404.pdf
+Assessment of the projects.pdf
